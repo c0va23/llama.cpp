@@ -527,10 +527,13 @@ struct mtmd_context {
 
     // TODO @ngxson : add timings
 
+    // when `mmproj_file` is non-null the projector GGUF is loaded from that
+    // already-open FILE* (owned by the caller), otherwise from `mmproj_fname`
     mtmd_context(const char * mmproj_fname,
                    const llama_model * text_model,
                    const mtmd_context_params & ctx_params,
-                   bool no_alloc = false) :
+                   bool no_alloc = false,
+                   FILE * mmproj_file = nullptr) :
         print_timings   (ctx_params.print_timings),
         n_threads       (ctx_params.n_threads),
         media_marker    (ctx_params.media_marker),
@@ -579,12 +582,15 @@ struct mtmd_context {
             /* progress_callback_user_data */ ctx_params.progress_callback_user_data,
         };
 
-        auto res = clip_init(mmproj_fname, ctx_clip_params);
+        auto res = mmproj_file
+            ? clip_init_from_file_ptr(mmproj_file, ctx_clip_params)
+            : clip_init(mmproj_fname, ctx_clip_params);
         ctx_v = res.ctx_v;
         ctx_a = res.ctx_a;
         ctx_gen_a = res.ctx_gen_a;
         if (!ctx_v && !ctx_a) {
-            throw std::runtime_error(string_format("Failed to load CLIP model from %s\n", mmproj_fname));
+            throw std::runtime_error(string_format("Failed to load CLIP model from %s\n",
+                mmproj_file ? "FILE*" : mmproj_fname));
         }
 
         // if both vision and audio mmproj are present, we need to validate their n_embd
@@ -1087,6 +1093,18 @@ mtmd_context * mtmd_init_from_file(const char * mmproj_fname,
         const struct mtmd_context_params ctx_params) {
     try {
         return new mtmd_context(mmproj_fname, text_model, ctx_params);
+    } catch (const std::exception & e) {
+        LOG_ERR("%s: error: %s\n", __func__, e.what());
+        return nullptr;
+    }
+}
+
+mtmd_context * mtmd_init_from_file_ptr(FILE * file,
+        const struct llama_model * text_model,
+        const struct mtmd_context_params ctx_params) {
+    try {
+        return new mtmd_context(/* mmproj_fname */ nullptr, text_model, ctx_params,
+                                /* no_alloc */ false, /* mmproj_file */ file);
     } catch (const std::exception & e) {
         LOG_ERR("%s: error: %s\n", __func__, e.what());
         return nullptr;

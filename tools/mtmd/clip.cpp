@@ -1168,6 +1168,10 @@ struct clip_model_loader {
 
     std::string fname;
 
+    // externally-owned FILE* to read tensor data from; when null, the loader
+    // opens its own handle from `fname`. never closed by the loader.
+    FILE * external_file = nullptr;
+
     size_t model_size = 0; // in bytes
 
     bool has_vision    = false;
@@ -1195,6 +1199,30 @@ struct clip_model_loader {
         ctx_gguf = gguf_context_ptr(gguf_init_from_file(fname, params));
         if (!ctx_gguf.get()) {
             throw std::runtime_error(string_format("%s: failed to load CLIP model from %s. Does this file exist?\n", __func__, fname));
+        }
+
+        init_from_gguf(meta, skip_tensors);
+    }
+
+    // the FILE* is owned by the caller and is used for both the GGUF header
+    // and tensor data; offsets are relative to the position at call time
+    clip_model_loader(FILE * file,
+            bool skip_tensors = false,
+            mtmd_progress_callback progress_cb = nullptr,
+            void * progress_user_data = nullptr)
+        : external_file(file),
+          progress_callback(progress_cb),
+          progress_callback_user_data(progress_user_data) {
+        struct ggml_context * meta = nullptr;
+
+        struct gguf_init_params params = {
+            /*.no_alloc = */ true,
+            /*.ctx      = */ &meta,
+        };
+
+        ctx_gguf = gguf_context_ptr(gguf_init_from_file_ptr(file, params));
+        if (!ctx_gguf.get()) {
+            throw std::runtime_error(string_format("%s: failed to load CLIP model from FILE*\n", __func__));
         }
 
         init_from_gguf(meta, skip_tensors);
@@ -2113,11 +2141,16 @@ struct clip_model_loader {
         std::map<std::string, size_t> tensor_offset;
         std::vector<ggml_tensor *> tensors_to_load;
 
-        FILE * fin = ggml_fopen(fname.c_str(), "rb");
-        if (!fin) {
-            throw std::runtime_error(string_format("%s: failed to open %s\n", __func__, fname.c_str()));
+        FILE * fin = external_file;
+        const bool own_file = (fin == nullptr);
+        if (own_file) {
+            fin = ggml_fopen(fname.c_str(), "rb");
+            if (!fin) {
+                throw std::runtime_error(string_format("%s: failed to open %s\n", __func__, fname.c_str()));
+            }
         }
-        std::unique_ptr<FILE, int(*)(FILE *)> fin_guard(fin, &fclose);
+        // closes the handle on every exit path, but only if we opened it
+        std::unique_ptr<FILE, int(*)(FILE *)> fin_guard(own_file ? fin : nullptr, &fclose);
 
         // TODO @ngxson : support both audio and video in the future
         const char * prefix = model.modality == CLIP_MODALITY_AUDIO ? "a"
@@ -3650,7 +3683,8 @@ struct clip_model_loader {
                         }
                     }
                 }
-                LOG_DBG("%s: loaded %zu tensors from %s\n", __func__, tensors_to_load.size(), fname.c_str());
+                LOG_DBG("%s: loaded %zu tensors from %s\n", __func__, tensors_to_load.size(),
+                        fname.empty() ? "FILE*" : fname.c_str());
             } else {
                 LOG_DBG("%s: no_alloc is set, skipping tensor data loading (%zu tensors)\n", __func__, tensors_to_load.size());
             }
@@ -3985,6 +4019,19 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
         return clip_init_with_loader(loader, ctx_params);
     } catch (const std::exception & e) {
         LOG_ERR("%s: failed to load model '%s': %s\n", __func__, fname, e.what());
+        return {nullptr, nullptr, nullptr};
+    }
+}
+
+struct clip_init_result clip_init_from_file_ptr(FILE * file, struct clip_context_params ctx_params) {
+    try {
+        clip_model_loader loader(file,
+            /* skip_tensors */ false,
+            ctx_params.progress_callback,
+            ctx_params.progress_callback_user_data);
+        return clip_init_with_loader(loader, ctx_params);
+    } catch (const std::exception & e) {
+        LOG_ERR("%s: failed to load model from FILE*: %s\n", __func__, e.what());
         return {nullptr, nullptr, nullptr};
     }
 }
