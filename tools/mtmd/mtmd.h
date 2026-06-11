@@ -7,6 +7,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdio.h>
 
 #ifdef __cplusplus
 #include <map>
@@ -115,6 +116,15 @@ MTMD_API struct mtmd_context_params mtmd_context_params_default(void);
 MTMD_API mtmd_context * mtmd_init_from_file(const char * mmproj_fname,
                                             const struct llama_model * text_model,
                                             const struct mtmd_context_params ctx_params);
+
+// same as mtmd_init_from_file, but loads the projector GGUF from an
+// already-open FILE* starting at its current position
+// the FILE* is owned by the caller and is never closed by mtmd; all reads
+// happen during this call, so it can be closed as soon as this returns
+// return nullptr on failure
+MTMD_API mtmd_context * mtmd_init_from_file_ptr(FILE * file,
+                                                const struct llama_model * text_model,
+                                                const struct mtmd_context_params ctx_params);
 
 MTMD_API void mtmd_free(mtmd_context * ctx);
 

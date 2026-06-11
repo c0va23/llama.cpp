@@ -5,6 +5,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include <map>
 
@@ -60,6 +61,11 @@ struct clip_init_result {
 };
 
 struct clip_init_result clip_init(const char * fname, struct clip_context_params ctx_params);
+
+// same as clip_init, but loads from an already-open FILE* starting at its
+// current position; the FILE* is owned by the caller and is not closed here,
+// all reads happen before this returns
+struct clip_init_result clip_init_from_file_ptr(FILE * file, struct clip_context_params ctx_params);
 
 void clip_free(struct clip_ctx * ctx);
 
