@@ -28,6 +28,13 @@
 #include <functional>
 #include <float.h>
 
+// 64-bit fseek, same as gguf.cpp and llama-mmap.cpp
+#if defined(_WIN32)
+#    define clip_fseek _fseeki64
+#else
+#    define clip_fseek fseeko
+#endif
+
 struct clip_logger_state g_logger_state = {clip_log_callback_default, NULL};
 
 //#define CLIP_DEBUG_FUNCTIONS
@@ -1329,6 +1336,10 @@ struct clip_model_loader {
             throw std::runtime_error(string_format("%s: failed to load CLIP model from %s. Does this file exist?\n", __func__, fname));
         }
 
+        init_from_gguf(meta, skip_tensors);
+    }
+
+    void init_from_gguf(struct ggml_context * meta, bool skip_tensors) {
         ctx_meta.reset(meta);
 
         const int n_tensors = gguf_get_n_tensors(ctx_gguf.get());
@@ -2564,10 +2575,11 @@ struct clip_model_loader {
         std::map<std::string, size_t> tensor_offset;
         std::vector<ggml_tensor *> tensors_to_load;
 
-        auto fin = open_ifstream_binary(fname);
+        FILE * fin = ggml_fopen(fname.c_str(), "rb");
         if (!fin) {
             throw std::runtime_error(string_format("%s: failed to open %s\n", __func__, fname.c_str()));
         }
+        std::unique_ptr<FILE, int(*)(FILE *)> fin_guard(fin, &fclose);
 
         // TODO @ngxson : support both audio and video in the future
         const char * prefix = model.modality == CLIP_MODALITY_AUDIO ? "a"
@@ -2663,8 +2675,12 @@ struct clip_model_loader {
 
             const size_t n_elems = n_bytes / sizeof(float);
             result.resize(n_elems);
-            fin.seekg(it->second, std::ios::beg);
-            fin.read(reinterpret_cast<char*>(result.data()), n_bytes);
+            if (clip_fseek(fin, static_cast<int64_t>(it->second), SEEK_SET) != 0) {
+                throw std::runtime_error(string_format("%s: failed to seek for tensor %s\n", __func__, name.c_str()));
+            }
+            if (fread(result.data(), 1, n_bytes, fin) != n_bytes) {
+                throw std::runtime_error(string_format("%s: failed to read tensor %s\n", __func__, name.c_str()));
+            }
             return result;
         };
 
@@ -3684,8 +3700,8 @@ struct clip_model_loader {
                         }
                         auto & embd = model.gen_voices[name + 6].rows;
                         embd.resize(ggml_nelements(t));
-                        fin.seekg(tensor_offset.at(name), std::ios::beg);
-                        if (!fin.read(reinterpret_cast<char *>(embd.data()), ggml_nbytes(t))) {
+                        if (clip_fseek(fin, static_cast<int64_t>(tensor_offset.at(name)), SEEK_SET) != 0 ||
+                                fread(embd.data(), 1, ggml_nbytes(t), fin) != ggml_nbytes(t)) {
                             throw std::runtime_error(string_format("%s: failed to read %s\n", __func__, name));
                         }
                     }
@@ -4028,8 +4044,8 @@ struct clip_model_loader {
                         if (!ok) {
                             throw std::runtime_error(string_format("%s: invalid voice tensor %s\n", __func__, name.c_str()));
                         }
-                        fin.seekg(tensor_offset.at(name), std::ios::beg);
-                        if (!fin.read(reinterpret_cast<char *>(dst), ggml_nbytes(t))) {
+                        if (clip_fseek(fin, static_cast<int64_t>(tensor_offset.at(name)), SEEK_SET) != 0 ||
+                                fread(dst, 1, ggml_nbytes(t), fin) != ggml_nbytes(t)) {
                             throw std::runtime_error(string_format("%s: failed to read %s\n", __func__, name.c_str()));
                         }
                         if (!ids.empty()) {
@@ -4751,18 +4767,21 @@ struct clip_model_loader {
                     auto it_off = tensor_offset.find(t->name);
                     GGML_ASSERT(it_off != tensor_offset.end() && "no offset for tensor");
                     const size_t offset = it_off->second;
-                    fin.seekg(offset, std::ios::beg);
-                    if (!fin) {
+                    if (clip_fseek(fin, static_cast<int64_t>(offset), SEEK_SET) != 0) {
                         throw std::runtime_error(string_format("%s: failed to seek for tensor %s\n", __func__, t->name));
                     }
                     size_t num_bytes = ggml_nbytes(cur);
                     if (ggml_backend_buft_is_host(buft)) {
                         // for the CPU and Metal backend, we can read directly into the tensor
-                        fin.read(reinterpret_cast<char *>(cur->data), num_bytes);
+                        if (fread(cur->data, 1, num_bytes, fin) != num_bytes) {
+                            throw std::runtime_error(string_format("%s: failed to read tensor %s\n", __func__, t->name));
+                        }
                     } else {
                         // read into a temporary buffer first, then copy to device memory
                         read_buf.resize(num_bytes);
-                        fin.read(reinterpret_cast<char *>(read_buf.data()), num_bytes);
+                        if (fread(read_buf.data(), 1, num_bytes, fin) != num_bytes) {
+                            throw std::runtime_error(string_format("%s: failed to read tensor %s\n", __func__, t->name));
+                        }
                         ggml_backend_tensor_set(cur, read_buf.data(), 0, num_bytes);
                     }
                     data_loaded += num_bytes;
@@ -4777,7 +4796,6 @@ struct clip_model_loader {
             } else {
                 LOG_DBG("%s: no_alloc is set, skipping tensor data loading (%zu tensors)\n", __func__, tensors_to_load.size());
             }
-            fin.close();
         }
 
     }
@@ -5096,16 +5114,30 @@ struct clip_model_loader {
     }
 };
 
-struct clip_init_result clip_init(const char * fname, struct clip_context_params ctx_params) {
-    clip_ctx * ctx_vision = nullptr;
-    clip_ctx * ctx_audio = nullptr;
-    clip_ctx * ctx_gen_audio = nullptr;
+// the loading body, extracted from clip_init below; defined after it so the
+// public entry point stays on top and the decomposition reads top-down
+static struct clip_init_result clip_init_with_loader(clip_model_loader & loader, struct clip_context_params ctx_params);
 
+struct clip_init_result clip_init(const char * fname, struct clip_context_params ctx_params) {
     try {
         clip_model_loader loader(fname,
             /* skip_tensors */ false,
             ctx_params.progress_callback,
             ctx_params.progress_callback_user_data);
+        return clip_init_with_loader(loader, ctx_params);
+    } catch (const std::exception & e) {
+        LOG_ERR("%s: failed to load model '%s': %s\n", __func__, fname, e.what());
+        return {nullptr, nullptr, nullptr};
+    }
+}
+
+// load the modality contexts from an already-constructed loader; throws on failure
+static struct clip_init_result clip_init_with_loader(clip_model_loader & loader, struct clip_context_params ctx_params) {
+    clip_ctx * ctx_vision = nullptr;
+    clip_ctx * ctx_audio = nullptr;
+    clip_ctx * ctx_gen_audio = nullptr;
+
+    try {
         bool skip_audio = false;
 
         if (loader.has_vision) {
@@ -5155,14 +5187,11 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
                                                    ggml_graph_overhead_custom(ctx_gen_audio->max_nodes, false));
         }
 
-    } catch (const std::exception & e) {
-        LOG_ERR("%s: failed to load model '%s': %s\n", __func__, fname, e.what());
-
+    } catch (...) {
         delete ctx_vision;
         delete ctx_audio;
         delete ctx_gen_audio;
-
-        return {nullptr, nullptr, nullptr};
+        throw;
     }
 
     return {ctx_vision, ctx_audio, ctx_gen_audio};
