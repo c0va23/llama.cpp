@@ -36,18 +36,32 @@ endfunction()
 #  TEST_SHADER_FILE - Path to the test shader file
 #  RESULT_VARIABLE - Name of the variable to set (ON/OFF) based on test result
 function(test_shader_extension_support EXTENSION_NAME TEST_SHADER_FILE RESULT_VARIABLE)
-    execute_process(
-        COMMAND ${Vulkan_GLSLC_EXECUTABLE} -o - -fshader-stage=compute --target-env=vulkan1.3 "${TEST_SHADER_FILE}"
-        OUTPUT_VARIABLE glslc_output
-        ERROR_VARIABLE glslc_error
-    )
-
-    if (${glslc_error} MATCHES ".*extension not supported: ${EXTENSION_NAME}.*")
-        message(STATUS "${EXTENSION_NAME} not supported by glslc")
-        set(${RESULT_VARIABLE} OFF PARENT_SCOPE)
+    # The probe answers whether glslc *can* build the extension, never whether this
+    # build wants to ship it — and every enabled extension multiplies the SPIR-V
+    # embedded in the backend. A caller that pre-sets the variable has already
+    # answered the second question, so take it rather than probing over the top.
+    if (DEFINED ${RESULT_VARIABLE})
+        set(extension_supported ${${RESULT_VARIABLE}})
+        message(STATUS "${EXTENSION_NAME} support set to ${extension_supported} by the caller")
     else()
-        message(STATUS "${EXTENSION_NAME} supported by glslc")
-        set(${RESULT_VARIABLE} ON PARENT_SCOPE)
+        execute_process(
+            COMMAND ${Vulkan_GLSLC_EXECUTABLE} -o - -fshader-stage=compute --target-env=vulkan1.3 "${TEST_SHADER_FILE}"
+            OUTPUT_VARIABLE glslc_output
+            ERROR_VARIABLE glslc_error
+        )
+
+        if (${glslc_error} MATCHES ".*extension not supported: ${EXTENSION_NAME}.*")
+            message(STATUS "${EXTENSION_NAME} not supported by glslc")
+            set(extension_supported OFF)
+        else()
+            message(STATUS "${EXTENSION_NAME} supported by glslc")
+            set(extension_supported ON)
+        endif()
+    endif()
+
+    set(${RESULT_VARIABLE} ${extension_supported} PARENT_SCOPE)
+
+    if (extension_supported)
         add_compile_definitions(${RESULT_VARIABLE})
 
         # Ensure the extension support is forwarded to vulkan-shaders-gen
