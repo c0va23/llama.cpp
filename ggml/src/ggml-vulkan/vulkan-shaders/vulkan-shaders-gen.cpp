@@ -6,6 +6,7 @@
 #include <array>
 #include <vector>
 #include <map>
+#include <set>
 #include <thread>
 #include <mutex>
 #include <future>
@@ -35,6 +36,12 @@
 
 std::mutex lock;
 std::vector<std::pair<std::string, std::string>> shader_fnames;
+
+// Quant types this build omits (--exclude-types) and the shader names that fell
+// out as a result. ggml-vulkan.cpp names every shader unconditionally, so an
+// omitted one still needs its symbols; they are emitted with a zero length.
+std::set<std::string> excluded_types;
+std::set<std::string> omitted_shader_names;
 // Set when any shader subprocess fails (non-zero exit / stderr / launch failure) so the
 // build is stopped instead of silently producing a broken libggml-vulkan. (issue #24393)
 static std::atomic<bool> compile_failed{false};
@@ -214,6 +221,18 @@ std::string to_uppercase(const std::string& input) {
         c = std::toupper(c);
     }
     return result;
+}
+
+// Which quant type a shader belongs to is carried by its DATA_A_<TYPE> define,
+// which every type-specific variant sets. Keying on that rather than on the
+// shader name keeps accumulator, subgroup and coopmat suffixes out of the match.
+bool shader_type_is_excluded(const std::map<std::string, std::string>& defines) {
+    for (const std::string& type : excluded_types) {
+        if (defines.count("DATA_A_" + to_uppercase(type)) > 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool string_starts_with(const std::string& str, const std::string& prefix) {
@@ -443,6 +462,15 @@ void string_to_spv(std::string name, const std::string& source, const std::map<s
         return;
     } else if (basename(input_filepath) != source) {
         // Only compile shader variants matching the input filename
+        return;
+    }
+
+    if (shader_type_is_excluded(defines)) {
+        // Compile workers already spawned for earlier variants push to
+        // shader_fnames under `lock`, so this thread must take it too.
+        std::lock_guard<std::mutex> guard(lock);
+        omitted_shader_names.insert(name);
+        shader_fnames.push_back(std::pair(name, out_path));
         return;
     }
 
@@ -1247,6 +1275,14 @@ void write_output_files() {
         hdr << "extern const unsigned char " << name << "_data[];\n\n";
 
         if (input_filepath != "") {
+            if (omitted_shader_names.count(name) > 0) {
+                // A zero length is what tells the backend no pipeline can be
+                // built from this entry; the array exists only to link.
+                src << "const uint64_t " << name << "_len = 0;\n";
+                src << "const unsigned char " << name << "_data[1] = {0};\n\n";
+                continue;
+            }
+
             std::string data = read_binary_file(path);
             if (data.empty()) {
                 continue;
@@ -1370,6 +1406,13 @@ void write_output_files() {
     }
     if (target_cpp != "") {
         write_binary_file(target_cpp, src.str());
+        // Every variant of this source was excluded, so glslc never ran and never
+        // wrote the depfile the build declares for this target. Write the rule here
+        // instead: without it each build warns that the depfile is missing, and the
+        // real diagnostics are lost among the warnings.
+        if (generate_dep_file) {
+            write_binary_file(target_cpp + ".d", target_cpp + ": " + input_filepath + "\n");
+        }
     }
 }
 
@@ -1400,6 +1443,16 @@ int main(int argc, char** argv) {
     }
     if (args.find("--target-hpp") != args.end()) {
         target_hpp = args["--target-hpp"]; // Path to generated header file
+    }
+    if (args.find("--exclude-types") != args.end()) {
+        // Comma-separated quant type names, spelled as in type_names.
+        std::stringstream names(args["--exclude-types"]);
+        std::string type;
+        while (std::getline(names, type, ',')) {
+            if (!type.empty()) {
+                excluded_types.insert(type);
+            }
+        }
     }
     if (args.find("--target-cpp") != args.end()) {
         target_cpp = args["--target-cpp"]; // Path to generated cpp file

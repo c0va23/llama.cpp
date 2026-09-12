@@ -36,18 +36,32 @@ endfunction()
 #  TEST_SHADER_FILE - Path to the test shader file
 #  RESULT_VARIABLE - Name of the variable to set (ON/OFF) based on test result
 function(test_shader_extension_support EXTENSION_NAME TEST_SHADER_FILE RESULT_VARIABLE)
-    execute_process(
-        COMMAND ${Vulkan_GLSLC_EXECUTABLE} -o - -fshader-stage=compute --target-env=vulkan1.3 "${TEST_SHADER_FILE}"
-        OUTPUT_VARIABLE glslc_output
-        ERROR_VARIABLE glslc_error
-    )
-
-    if (${glslc_error} MATCHES ".*extension not supported: ${EXTENSION_NAME}.*")
-        message(STATUS "${EXTENSION_NAME} not supported by glslc")
-        set(${RESULT_VARIABLE} OFF PARENT_SCOPE)
+    # The probe answers whether glslc *can* build the extension, never whether this
+    # build wants to ship it — and every enabled extension multiplies the SPIR-V
+    # embedded in the backend. A caller that pre-sets the variable has already
+    # answered the second question, so take it rather than probing over the top.
+    if (DEFINED ${RESULT_VARIABLE})
+        set(extension_supported ${${RESULT_VARIABLE}})
+        message(STATUS "${EXTENSION_NAME} support set to ${extension_supported} by the caller")
     else()
-        message(STATUS "${EXTENSION_NAME} supported by glslc")
-        set(${RESULT_VARIABLE} ON PARENT_SCOPE)
+        execute_process(
+            COMMAND ${Vulkan_GLSLC_EXECUTABLE} -o - -fshader-stage=compute --target-env=vulkan1.3 "${TEST_SHADER_FILE}"
+            OUTPUT_VARIABLE glslc_output
+            ERROR_VARIABLE glslc_error
+        )
+
+        if (${glslc_error} MATCHES ".*extension not supported: ${EXTENSION_NAME}.*")
+            message(STATUS "${EXTENSION_NAME} not supported by glslc")
+            set(extension_supported OFF)
+        else()
+            message(STATUS "${EXTENSION_NAME} supported by glslc")
+            set(extension_supported ON)
+        endif()
+    endif()
+
+    set(${RESULT_VARIABLE} ${extension_supported} PARENT_SCOPE)
+
+    if (extension_supported)
         add_compile_definitions(${RESULT_VARIABLE})
 
         # Ensure the extension support is forwarded to vulkan-shaders-gen
@@ -194,6 +208,25 @@ if (Vulkan_FOUND)
                         ${CMAKE_COMMAND} --install . --config $<CONFIG>
     )
 
+    # Quant types this build ships no shaders for. The generator still emits their
+    # symbols, with a zero length, so ggml-vulkan.cpp needs no per-type guards; the
+    # backend reads that zero and reports the type unsupported, which leaves those
+    # tensors to another backend instead of failing the model load.
+    set(_ggml_vk_excluded_types_arg "")
+    if (GGML_VULKAN_EXCLUDE_QUANT_TYPES)
+        string(REPLACE ";" "," _ggml_vk_excluded_types "${GGML_VULKAN_EXCLUDE_QUANT_TYPES}")
+        set(_ggml_vk_excluded_types_arg --exclude-types ${_ggml_vk_excluded_types})
+        message(STATUS "Vulkan: omitting shaders for quant types ${_ggml_vk_excluded_types}")
+
+        set(_ggml_vk_omitted_enums "")
+        foreach (_ggml_vk_type IN LISTS GGML_VULKAN_EXCLUDE_QUANT_TYPES)
+            string(TOUPPER "${_ggml_vk_type}" _ggml_vk_type_upper)
+            list(APPEND _ggml_vk_omitted_enums "GGML_TYPE_${_ggml_vk_type_upper}")
+        endforeach()
+        string(REPLACE ";" "," _ggml_vk_omitted_enums "${_ggml_vk_omitted_enums}")
+        add_compile_definitions(GGML_VULKAN_OMITTED_TYPES=${_ggml_vk_omitted_enums})
+    endif()
+
     set (_ggml_vk_host_suffix $<IF:$<STREQUAL:${CMAKE_HOST_SYSTEM_NAME},Windows>,.exe,>)
     set (_ggml_vk_genshaders_dir "${CMAKE_BINARY_DIR}/$<CONFIG>")
     set (_ggml_vk_genshaders_cmd "${_ggml_vk_genshaders_dir}/vulkan-shaders-gen${_ggml_vk_host_suffix}")
@@ -219,6 +252,7 @@ if (Vulkan_FOUND)
         COMMAND ${_ggml_vk_genshaders_cmd}
             --output-dir ${_ggml_vk_output_dir}
             --target-hpp ${_ggml_vk_header}
+            ${_ggml_vk_excluded_types_arg}
         DEPENDS ${_ggml_vk_shaders_gen_sources}
                 vulkan-shaders-gen
         COMMENT "Generate vulkan shaders header"
@@ -238,6 +272,7 @@ if (Vulkan_FOUND)
                 --output-dir ${_ggml_vk_output_dir}
                 --target-hpp ${_ggml_vk_header}
                 --target-cpp ${_ggml_vk_target_cpp}
+                ${_ggml_vk_excluded_types_arg}
             DEPENDS ${file_full}
                     ${_ggml_vk_shaders_gen_sources}
                     vulkan-shaders-gen

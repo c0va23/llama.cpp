@@ -4616,6 +4616,13 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                               uint32_t parameter_count, uint32_t push_constant_size, std::array<uint32_t, 3> wg_denoms, const std::vector<uint32_t>& specialization_constants,
                                               uint32_t align, bool disable_robustness = false, bool require_full_subgroups = false, uint32_t required_subgroup_size = 0) {
 
+        // GGML_VULKAN_EXCLUDE_QUANT_TYPES leaves a zero-length blob in place of the
+        // shader. Returning before the pipeline is even allocated keeps every caller
+        // below unchanged; ggml_vk_type_shaders_omitted() keeps the ops away.
+        if (spv_size == 0) {
+            return;
+        }
+
         if (!require_full_subgroups && required_subgroup_size == 0) {
             required_subgroup_size = get_subgroup_size(name, device->architecture);
         }
@@ -19123,9 +19130,36 @@ static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const 
     return ggml_backend_vk_init(ctx->device);
 }
 
+// Quant types GGML_VULKAN_EXCLUDE_QUANT_TYPES dropped from this build. Their
+// shaders are zero-length blobs, so no pipeline exists to run them.
+static bool ggml_vk_type_shaders_omitted(ggml_type type) {
+#ifdef GGML_VULKAN_OMITTED_TYPES
+    for (const ggml_type omitted : { GGML_VULKAN_OMITTED_TYPES }) {
+        if (type == omitted) {
+            return true;
+        }
+    }
+#else
+    GGML_UNUSED(type);
+#endif
+    return false;
+}
+
 static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
     const vk_device& device = ggml_vk_get_device(ctx->device);
+
+    // Refuse anything touching an omitted type before the op-specific checks below
+    // decide it is supported: the scheduler then leaves those tensors to another
+    // backend, which is the difference between a slow model and one that cannot load.
+    if (ggml_vk_type_shaders_omitted(op->type)) {
+        return false;
+    }
+    for (const ggml_tensor * src : op->src) {
+        if (src != nullptr && ggml_vk_type_shaders_omitted(src->type)) {
+            return false;
+        }
+    }
 
     const bool uses_bda = (op->op == GGML_OP_IM2COL || op->op == GGML_OP_IM2COL_3D) &&
                           device->shader_int64 && device->buffer_device_address;
