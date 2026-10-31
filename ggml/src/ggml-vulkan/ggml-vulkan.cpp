@@ -4020,6 +4020,23 @@ static bool ggml_vk_host_buffer_import_usable(uint32_t vendor_id) {
     return vendor_id != VK_VENDOR_ID_AMD;
 }
 
+// On Mali the matrix kernels cost about as much for a batch of 9 as for one several times wider
+// (2.8 s on a Mali-G78, where 8 columns through mul_mat_vec take 0.45 s). The crossover differs
+// per GPU, so the bound comes from the device name, with a conservative one for other Malis.
+static uint32_t ggml_vk_mul_mat_vec_split_max_cols(const vk_device& device) {
+    if (device->vendor_id != VK_VENDOR_ID_ARM) {
+        return 0;
+    }
+    const std::string device_name = device->properties.deviceName.data();
+    if (device_name.find("Mali-G78") != std::string::npos) {
+        return mul_mat_vec_split_max_cols_mali_g78;
+    }
+    if (device_name.find("Mali-G715") != std::string::npos) {
+        return mul_mat_vec_split_max_cols_mali_g715;
+    }
+    return mul_mat_vec_split_max_cols_mali_other;
+}
+
 vk_device ggml_vk_get_device(size_t idx) {
     VK_LOG_DEBUG("ggml_vk_get_device(" << idx << ")");
 
@@ -4955,6 +4972,8 @@ vk_device ggml_vk_get_device(size_t idx) {
         } else if (getenv("GGML_VK_FORCE_MMVQ")) {
             device->mmvq_mode = 1;
         }
+
+        device->mul_mat_vec_split_max_cols = ggml_vk_mul_mat_vec_split_max_cols(device);
 
         // publish the device only when it is fully built
         vk_instance.devices[idx] = device;
@@ -6761,6 +6780,10 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
     GGML_UNUSED(m);
 }
 
+static uint32_t ggml_vk_mul_mat_vec_max_batch(const vk_device& device) {
+    return std::max(mul_mat_vec_max_cols, device->mul_mat_vec_split_max_cols);
+}
+
 static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx, bool swap_inputs = false) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     const ggml_tensor * src0 = dst->src[swap_inputs ? 1 : 0];
@@ -6817,15 +6840,21 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
         to_fp16_vk_1 = ggml_vk_get_to_fp16(ctx, src1->type);
     }
 
+    // A batch wider than mul_mat_vec_max_cols runs as passes of that many columns plus one for the rest.
+    const uint32_t pass_cols = std::min<uint32_t>(ne11, mul_mat_vec_max_cols);
+    const uint32_t full_passes = ne11 / pass_cols;
+    const uint32_t tail_cols = ne11 % pass_cols;
+
     // Check for mmq first
-    vk_pipeline dmmv = quantize_y ? ggml_vk_get_dequantize_mul_mat_vec(ctx, src0->type, GGML_TYPE_Q8_1, ne11, ne20, ne00) : nullptr;
+    vk_pipeline dmmv = quantize_y ? ggml_vk_get_dequantize_mul_mat_vec(ctx, src0->type, GGML_TYPE_Q8_1, pass_cols, ne20, ne00) : nullptr;
     vk_pipeline to_q8_1 = nullptr;
 
     if (dmmv == nullptr) {
         // Fall back to f16 dequant mul mat
-        dmmv = ggml_vk_get_dequantize_mul_mat_vec(ctx, src0->type, y_kernel_type, ne11, ne20, ne00);
+        dmmv = ggml_vk_get_dequantize_mul_mat_vec(ctx, src0->type, y_kernel_type, pass_cols, ne20, ne00);
         quantize_y = false;
     }
+    vk_pipeline dmmv_tail = tail_cols > 0 ? ggml_vk_get_dequantize_mul_mat_vec(ctx, src0->type, quantize_y ? GGML_TYPE_Q8_1 : y_kernel_type, tail_cols, ne20, ne00) : nullptr;
 
     if (quantize_y) {
         to_q8_1 = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
@@ -6833,6 +6862,9 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
 
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         dmmv = ggml_vk_get_64b_indexing_pipeline(ctx, dmmv);
+        if (dmmv_tail != nullptr) {
+            dmmv_tail = ggml_vk_get_64b_indexing_pipeline(ctx, dmmv_tail);
+        }
     }
 
     const bool qx_needs_dequant = x_non_contig;
@@ -6844,6 +6876,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     GGML_ASSERT(!qx_needs_dequant || to_fp16_vk_0 != nullptr);  // NOLINT
     GGML_ASSERT(!qy_needs_dequant || to_fp16_vk_1 != nullptr);  // NOLINT
     GGML_ASSERT(dmmv != nullptr);
+    GGML_ASSERT(tail_cols == 0 || dmmv_tail != nullptr);
 
     const uint64_t x_ne = ggml_nelements(src0);
     const uint64_t y_ne = ggml_nelements(src1);
@@ -6976,19 +7009,14 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
         fusion_flags |= MAT_VEC_FUSION_FLAGS_BIAS1;
     }
 
-    ggml_pipeline_request_descriptor_sets(ctx, dmmv, CEIL_DIV(ne12 * ne13, ctx->device->properties.limits.maxComputeWorkGroupCount[1]));
-
-    uint32_t base_work_group_y = 0;
-    while (base_work_group_y < ne12 * ne13) {
-
-        uint32_t groups_y = std::min((uint32_t)(ne12 * ne13) - base_work_group_y, ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+    auto dispatch = [&](vk_pipeline& pipeline, uint32_t base_work_group_y, uint32_t groups_y) {
         const vk_mat_vec_push_constants pc = {
             (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne01,
             stride_batch_x, stride_batch_y, stride_batch_d,
             fusion_flags, base_work_group_y,
             (uint32_t)ne02, (uint32_t)ne12, (uint32_t)r2, (uint32_t)r3,
         };
-        ggml_vk_dispatch_pipeline(ctx, subctx, dmmv,
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
                                   {
                                     d_X,
                                     d_Y,
@@ -6997,7 +7025,30 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
                                     d_F1,
                                   },
                                   pc, { groups_x, groups_y, groups_z });
-        base_work_group_y += groups_y;
+    };
+
+    if (ne11 > pass_cols) {
+        // With batch_n the shader's batch index steps B and D by one column and leaves A in place
+        // (stride_batch_x is 0), so base_work_group_y selects the first column of a pass.
+        ggml_pipeline_request_descriptor_sets(ctx, dmmv, full_passes);
+        if (dmmv_tail != nullptr) {
+            ggml_pipeline_request_descriptor_sets(ctx, dmmv_tail, 1);
+        }
+        for (uint32_t pass = 0; pass < full_passes; ++pass) {
+            dispatch(dmmv, pass * pass_cols, 1);
+        }
+        if (dmmv_tail != nullptr) {
+            dispatch(dmmv_tail, full_passes * pass_cols, 1);
+        }
+    } else {
+        ggml_pipeline_request_descriptor_sets(ctx, dmmv, CEIL_DIV(ne12 * ne13, ctx->device->properties.limits.maxComputeWorkGroupCount[1]));
+
+        uint32_t base_work_group_y = 0;
+        while (base_work_group_y < ne12 * ne13) {
+            uint32_t groups_y = std::min((uint32_t)(ne12 * ne13) - base_work_group_y, ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+            dispatch(dmmv, base_work_group_y, groups_y);
+            base_work_group_y += groups_y;
+        }
     }
 
     if (x_non_contig) {
@@ -7421,9 +7472,9 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
                ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
                get_misalign_bytes(ctx, src0) == 0 && get_misalign_bytes(ctx, src1) == 0 && get_misalign_bytes(ctx, dst) == 0) {
         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx, true);
-    // mul_mat_vec supports batching ne12*ne13 when ne11==1, or treating ne11 as the batch size (up to four)
-    // when ne12 and ne13 are one.
-    } else if ((dst->ne[1] == 1 || (dst->ne[1] <= mul_mat_vec_max_cols && src1->ne[2] * src1->ne[3] == 1)) &&
+    // mul_mat_vec supports batching ne12*ne13 when ne11==1, or treating ne11 as the batch size (up to
+    // mul_mat_vec_max_cols, or the device's split bound in several passes) when ne12 and ne13 are one.
+    } else if ((dst->ne[1] == 1 || (dst->ne[1] <= ggml_vk_mul_mat_vec_max_batch(ctx->device) && src1->ne[2] * src1->ne[3] == 1)) &&
                (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type))) {
         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx);
     } else {
