@@ -16495,6 +16495,10 @@ bool ggml_vk_khr_cooperative_matrix_support(const vk::PhysicalDeviceProperties& 
     case VK_VENDOR_ID_QUALCOMM:
         // Only allow Adreno GPUs with hardware matrix cores (Gen 6+).
         return arch == vk_device_architecture::QUALCOMM_ADRENO;
+    case VK_VENDOR_ID_ARM:
+        // Mali reports KHR_coopmat (e.g. G715), but its matrix kernels run large batches
+        // several times slower than the plain ones.
+        return false;
     default:
         return true;
     }
