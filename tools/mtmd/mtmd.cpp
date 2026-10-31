@@ -3324,6 +3324,31 @@ const char * mtmd_get_marker(const mtmd_context * ctx) {
     return ctx->media_marker.c_str();
 }
 
+size_t mtmd_get_memory_breakdown(const mtmd_context * ctx, mtmd_memory_breakdown * out, size_t n_max) {
+    std::map<ggml_backend_buffer_type_t, clip_buft_memory> total;
+    for (const clip_ctx * clip : { ctx->ctx_v, ctx->ctx_a, ctx->ctx_gen_a }) {
+        if (!clip) {
+            continue;
+        }
+        for (const auto & [buft, memory] : clip_get_memory_breakdown(clip)) {
+            total[buft].model   += memory.model;
+            total[buft].compute += memory.compute;
+        }
+    }
+
+    size_t n_rows = 0;
+    for (const auto & [buft, memory] : total) {
+        if (memory.model == 0 && memory.compute == 0) {
+            continue;
+        }
+        if (out && n_rows < n_max) {
+            out[n_rows] = { ggml_backend_buft_name(buft), memory.model, memory.compute };
+        }
+        n_rows++;
+    }
+    return n_rows;
+}
+
 //
 // public API functions
 //

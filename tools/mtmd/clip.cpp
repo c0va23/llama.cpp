@@ -8115,6 +8115,23 @@ std::map<ggml_backend_dev_t, size_t> clip_get_mem_usage(const struct clip_ctx * 
     return result;
 }
 
+std::map<ggml_backend_buffer_type_t, clip_buft_memory> clip_get_memory_breakdown(const struct clip_ctx * ctx) {
+    std::map<ggml_backend_buffer_type_t, clip_buft_memory> result;
+    if (ctx->buf) {
+        result[ggml_backend_buffer_get_type(ctx->buf.get())].model += ggml_backend_buffer_get_size(ctx->buf.get());
+    }
+    // the scheduler grows its buffers when a larger image needs more, so read them now rather than
+    // the sizes recorded at reserve time
+    for (size_t i = 0; i < ctx->backend_ptrs.size(); ++i) {
+        result[ctx->backend_buft[i]].compute += ggml_backend_sched_get_buffer_size(ctx->sched.get(), ctx->backend_ptrs[i]);
+    }
+    // the graph metadata arena is a host allocation of its own, a few MiB at max_nodes
+    if (ctx->buf_compute_meta.capacity() > 0) {
+        result[ggml_backend_get_default_buffer_type(ctx->backend_cpu)].compute += ctx->buf_compute_meta.capacity();
+    }
+    return result;
+}
+
 //
 // API for debugging
 //
