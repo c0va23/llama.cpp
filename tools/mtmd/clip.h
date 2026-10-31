@@ -152,6 +152,14 @@ int clip_model_n_temporal_merge(const struct clip_ctx * ctx); // TODO @ngxson : 
 
 std::map<ggml_backend_dev_t, size_t> clip_get_mem_usage(const struct clip_ctx * ctx);
 
+struct clip_buft_memory {
+    size_t model;   // weights
+    size_t compute; // scheduler compute buffers, and the graph metadata arena on the CPU type
+};
+
+// allocated bytes per buffer type, as the context holds them now
+std::map<ggml_backend_buffer_type_t, clip_buft_memory> clip_get_memory_breakdown(const struct clip_ctx * ctx);
+
 struct clip_cap {
     bool has_vision;
     bool has_audio;
