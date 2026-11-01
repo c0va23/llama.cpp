@@ -182,6 +182,8 @@ static bool is_pow2(uint32_t x) { return x > 1 && (x & (x-1)) == 0; }
 
 #define VK_VENDOR_ID_APPLE 0x106b
 
+#define VK_VENDOR_ID_ARM 0x13b5
+
 #define VK_VENDOR_ID_INTEL 0x8086
 
 #define VK_VENDOR_ID_NVIDIA 0x10de
@@ -360,6 +362,11 @@ struct vk_queue {
 };
 
 static constexpr uint32_t mul_mat_vec_max_cols = 8;
+// Up to these batch sizes the vector passes beat one matrix call (llama-bench, Q4_K_M 1.7B):
+// the matrix kernels overtake them between 32 and 48 tokens on the G78, just above 24 on the G715.
+static constexpr uint32_t mul_mat_vec_split_max_cols_mali_g78 = 32;
+static constexpr uint32_t mul_mat_vec_split_max_cols_mali_g715 = 24;
+static constexpr uint32_t mul_mat_vec_split_max_cols_mali_other = 16;
 
 static constexpr uint32_t p021_max_gqa_ratio = 8;
 
@@ -720,6 +727,9 @@ struct vk_device_struct {
     bool integer_dot_product;
     // 0: default, 1: force mmvq, -1: disable mmvq
     int32_t mmvq_mode;
+    // Largest mul_mat batch run as several mul_mat_vec passes of up to mul_mat_vec_max_cols
+    // columns instead of the matrix kernels; 0 leaves batches above mul_mat_vec_max_cols to them.
+    uint32_t mul_mat_vec_split_max_cols;
 
     bool subgroup_size_control;
     uint32_t subgroup_min_size;
