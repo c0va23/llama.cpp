@@ -191,6 +191,23 @@ MTMD_API struct mtmd_video_config mtmd_get_video_config(const mtmd_context * ctx
 // get the current marker string
 MTMD_API const char * mtmd_get_marker(const mtmd_context * ctx);
 
+// memory the projector holds in one backend buffer type
+struct mtmd_memory_breakdown {
+    const char * buft_name;     // ggml_backend_buft_name(), valid while the backend is loaded
+    size_t       model_bytes;   // weight buffers
+    size_t       compute_bytes; // compute buffers of the encoder schedulers, plus their graph metadata on the CPU row
+};
+
+// fill `out` with up to `n_max` rows, one per buffer type, summed over the vision and audio encoders
+// sizes are what is allocated now, so compute buffers grow after encoding a larger input
+// covers what the context owns: the state of an mtmd_audio_stream or mtmd_gen_state is not included
+// reads the schedulers' buffers, which an encode may reallocate: do not call it while another
+// thread encodes, decodes or generates with the same context
+// returns the number of rows available, which may exceed n_max; pass out = NULL, n_max = 0 to count them
+MTMD_API size_t mtmd_get_memory_breakdown(const mtmd_context * ctx,
+                                          struct mtmd_memory_breakdown * out,
+                                          size_t n_max);
+
 // mtmd_bitmap
 //
 // if bitmap is image:
