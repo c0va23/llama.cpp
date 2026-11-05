@@ -229,7 +229,9 @@ ggml_backend_t ggml_backend_cpu_init(void) {
     ctx->work_size           = 0;
     ctx->abort_callback      = NULL;
     ctx->abort_callback_data = NULL;
-    ctx->use_ref             = false;
+    // the reference kernels give a row the same result at any batch size
+    const char * use_ref_env = getenv("GGML_CPU_USE_REF");
+    ctx->use_ref             = use_ref_env != NULL && atoi(use_ref_env) == 1;
 
     ggml_backend_t cpu_backend = new ggml_backend {
         /* .guid    = */ ggml_backend_cpu_guid(),
