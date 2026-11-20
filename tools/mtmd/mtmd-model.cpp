@@ -25,6 +25,50 @@
 #include <functional>
 #include <float.h>
 
+// 64-bit fseek, same as gguf.cpp and llama-mmap.cpp
+#if defined(_WIN32)
+#    define mtmd_fseek _fseeki64
+#else
+#    define mtmd_fseek fseeko
+#endif
+
+// reads tensor data through a FILE*, with the seekg/read/operator bool subset of std::ifstream the
+// loader uses, so that it can read from a handle it did not open; a failed seek or a short read throws
+struct mtmd_tensor_reader {
+    FILE * file  = nullptr;
+    bool   owned = false;
+
+    mtmd_tensor_reader(FILE * file, bool owned) : file(file), owned(owned) {}
+    ~mtmd_tensor_reader() { close(); }
+
+    mtmd_tensor_reader(const mtmd_tensor_reader &) = delete;
+    mtmd_tensor_reader & operator=(const mtmd_tensor_reader &) = delete;
+
+    mtmd_tensor_reader & seekg(size_t offset, std::ios::seekdir dir) {
+        GGML_ASSERT(dir == std::ios::beg);
+        if (file == nullptr || mtmd_fseek(file, static_cast<int64_t>(offset), SEEK_SET) != 0) {
+            throw std::runtime_error(mtmd_format("%s: failed to seek to offset %zu\n", __func__, offset));
+        }
+        return *this;
+    }
+
+    mtmd_tensor_reader & read(char * dst, size_t n_bytes) {
+        if (file == nullptr || fread(dst, 1, n_bytes, file) != n_bytes) {
+            throw std::runtime_error(mtmd_format("%s: failed to read %zu bytes\n", __func__, n_bytes));
+        }
+        return *this;
+    }
+
+    explicit operator bool() const { return file != nullptr; }
+
+    void close() {
+        if (owned && file != nullptr) {
+            fclose(file);
+        }
+        file = nullptr;
+    }
+};
+
 //
 // mtmd_model_loader
 //
@@ -1448,7 +1492,7 @@ struct mtmd_model_loader {
         std::map<std::string, size_t> tensor_offset;
         std::vector<ggml_tensor *> tensors_to_load;
 
-        auto fin = open_ifstream_binary(fname);
+        mtmd_tensor_reader fin(ggml_fopen(fname.c_str(), "rb"), /* owned */ true);
         if (!fin) {
             throw std::runtime_error(mtmd_format("%s: failed to open %s\n", __func__, fname.c_str()));
         }
