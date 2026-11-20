@@ -4695,6 +4695,47 @@ const char * mtmd_get_marker(const mtmd_context * ctx) {
     return ctx->media_marker.c_str();
 }
 
+size_t mtmd_get_memory_breakdown(const mtmd_context * ctx, mtmd_memory_breakdown * out, size_t n_max) {
+    struct buft_memory {
+        size_t model   = 0;
+        size_t compute = 0;
+    };
+    std::map<ggml_backend_buffer_type_t, buft_memory> total;
+
+    for (const mtmd_model * model : { ctx->models.v.get(), ctx->models.a.get(), ctx->models.gen_a.get() }) {
+        if (model && model->buf) {
+            total[ggml_backend_buffer_get_type(model->buf.get())].model += ggml_backend_buffer_get_size(model->buf.get());
+        }
+    }
+
+    // the encoders share one scheduler, which grows its buffers when a larger input needs more,
+    // so read them now rather than the sizes recorded at reserve time
+    const mtmd_backends & backends = *ctx->backends;
+    for (size_t i = 0; i < backends.ptrs.size(); ++i) {
+        total[backends.bufts[i]].compute += ggml_backend_sched_get_buffer_size(backends.sched.get(), backends.ptrs[i]);
+    }
+
+    // each encoder's graph metadata arena is a host allocation of its own, a few MiB at max_nodes
+    const ggml_backend_buffer_type_t cpu_buft = ggml_backend_get_default_buffer_type(backends.backend_cpu);
+    for (const mtmd_subcontext * sctx : { ctx->ctx_v.get(), ctx->ctx_a.get(), ctx->ctx_gen_a.get() }) {
+        if (sctx) {
+            total[cpu_buft].compute += sctx->buf_compute_meta.capacity();
+        }
+    }
+
+    size_t n_rows = 0;
+    for (const auto & [buft, memory] : total) {
+        if (memory.model == 0 && memory.compute == 0) {
+            continue;
+        }
+        if (out && n_rows < n_max) {
+            out[n_rows] = { ggml_backend_buft_name(buft), memory.model, memory.compute };
+        }
+        n_rows++;
+    }
+    return n_rows;
+}
+
 //
 // public API functions
 //
