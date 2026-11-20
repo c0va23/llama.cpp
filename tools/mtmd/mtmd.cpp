@@ -894,10 +894,13 @@ struct mtmd_context {
 
     // TODO @ngxson : add timings
 
+    // when `mmproj_file` is non-null the projector GGUF is loaded from that
+    // already-open FILE* (owned by the caller), otherwise from `mmproj_fname`
     mtmd_context(const char * mmproj_fname,
                    const llama_model * text_model,
                    const mtmd_context_params & ctx_params,
-                   bool no_alloc = false) :
+                   bool no_alloc = false,
+                   FILE * mmproj_file = nullptr) :
         print_timings   (ctx_params.print_timings),
         n_threads       (ctx_params.n_threads),
         media_marker    (ctx_params.media_marker),
@@ -945,11 +948,22 @@ struct mtmd_context {
         ggml_backend_buffer_type_t buft = device
             ? ggml_backend_dev_buffer_type(device)
             : ggml_backend_dev_buffer_type(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
-        models = mtmd_model_load(mmproj_fname, model_params, buft);
+        models = mmproj_file
+            ? mtmd_model_load_from_file_ptr(mmproj_file, model_params, buft)
+            : mtmd_model_load(mmproj_fname, model_params, buft);
 
         // soprano and pocket-tts without voice cloning have no encoder
         if (!models.v && !models.a && !models.gen_a) {
-            throw std::runtime_error(mtmd_format("Failed to load mmproj model from %s\n", mmproj_fname));
+            throw std::runtime_error(mtmd_format("Failed to load mmproj model from %s\n",
+                mmproj_file ? "FILE*" : mmproj_fname));
+        }
+
+        // these load more layers from the file by name after the projector itself
+        if (mmproj_file && models.gen_a && !no_alloc &&
+                (models.gen_a->proj_type == PROJECTOR_TYPE_YUE2_GEN ||
+                 models.gen_a->proj_type == PROJECTOR_TYPE_VOXCPM2_GEN ||
+                 models.gen_a->proj_type == PROJECTOR_TYPE_TINY_VOCA)) {
+            throw std::runtime_error("this audio generation projector cannot be loaded from a FILE*");
         }
 
         int max_nodes = 0;
@@ -1641,6 +1655,18 @@ mtmd_context * mtmd_init_from_file(const char * mmproj_fname,
         const struct mtmd_context_params ctx_params) {
     try {
         return new mtmd_context(mmproj_fname, text_model, ctx_params);
+    } catch (const std::exception & e) {
+        LOG_ERR("%s: error: %s\n", __func__, e.what());
+        return nullptr;
+    }
+}
+
+mtmd_context * mtmd_init_from_file_ptr(FILE * file,
+        const struct llama_model * text_model,
+        const struct mtmd_context_params ctx_params) {
+    try {
+        return new mtmd_context(/* mmproj_fname */ nullptr, text_model, ctx_params,
+                                /* no_alloc */ false, /* mmproj_file */ file);
     } catch (const std::exception & e) {
         LOG_ERR("%s: error: %s\n", __func__, e.what());
         return nullptr;

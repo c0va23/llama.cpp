@@ -79,6 +79,10 @@ struct mtmd_model_loader {
 
     std::string fname;
 
+    // externally-owned FILE* to read tensor data from, never closed by the loader;
+    // when null, the loader opens its own handle from `fname`
+    FILE * external_file = nullptr;
+
     size_t model_size = 0; // in bytes
 
     bool has_vision    = false;
@@ -107,6 +111,34 @@ struct mtmd_model_loader {
             throw std::runtime_error(mtmd_format("%s: failed to load mmproj model from %s. Does this file exist?\n", __func__, fname));
         }
 
+        init_from_gguf(meta, skip_tensors);
+    }
+
+    // the FILE* is owned by the caller and is read for both the GGUF header and the tensor data,
+    // starting at its position at call time
+    mtmd_model_loader(FILE * file,
+            bool skip_tensors = false,
+            mtmd_progress_callback progress_cb = nullptr,
+            void * progress_user_data = nullptr)
+        : external_file(file),
+          progress_callback(progress_cb),
+          progress_callback_user_data(progress_user_data) {
+        struct ggml_context * meta = nullptr;
+
+        struct gguf_init_params params = {
+            /*.no_alloc = */ true,
+            /*.ctx      = */ &meta,
+        };
+
+        ctx_gguf = gguf_context_ptr(gguf_init_from_file_ptr(file, params));
+        if (!ctx_gguf.get()) {
+            throw std::runtime_error(mtmd_format("%s: failed to load mmproj model from FILE*\n", __func__));
+        }
+
+        init_from_gguf(meta, skip_tensors);
+    }
+
+    void init_from_gguf(struct ggml_context * meta, bool skip_tensors) {
         ctx_meta.reset(meta);
 
         const int n_tensors = gguf_get_n_tensors(ctx_gguf.get());
@@ -1492,7 +1524,8 @@ struct mtmd_model_loader {
         std::map<std::string, size_t> tensor_offset;
         std::vector<ggml_tensor *> tensors_to_load;
 
-        mtmd_tensor_reader fin(ggml_fopen(fname.c_str(), "rb"), /* owned */ true);
+        mtmd_tensor_reader fin(external_file ? external_file : ggml_fopen(fname.c_str(), "rb"),
+                               /* owned */ external_file == nullptr);
         if (!fin) {
             throw std::runtime_error(mtmd_format("%s: failed to open %s\n", __func__, fname.c_str()));
         }
@@ -4427,7 +4460,8 @@ struct mtmd_model_loader {
                         }
                     }
                 }
-                LOG_DBG("%s: loaded %zu tensors from %s\n", __func__, tensors_to_load.size(), fname.c_str());
+                LOG_DBG("%s: loaded %zu tensors from %s\n", __func__, tensors_to_load.size(),
+                        external_file ? "FILE*" : fname.c_str());
             } else {
                 LOG_DBG("%s: no_alloc is set, skipping tensor data loading (%zu tensors)\n", __func__, tensors_to_load.size());
             }
@@ -4590,12 +4624,25 @@ struct mtmd_model_loader {
 // loading
 //
 
+static mtmd_models mtmd_model_load_with_loader(mtmd_model_loader & loader, const mtmd_model_params & params, ggml_backend_buffer_type_t buft);
+
 mtmd_models mtmd_model_load(const char * fname, const mtmd_model_params & params, ggml_backend_buffer_type_t buft) {
     mtmd_model_loader loader(fname,
         /* skip_tensors */ false,
         params.progress_callback,
         params.progress_callback_user_data);
+    return mtmd_model_load_with_loader(loader, params, buft);
+}
 
+mtmd_models mtmd_model_load_from_file_ptr(FILE * file, const mtmd_model_params & params, ggml_backend_buffer_type_t buft) {
+    mtmd_model_loader loader(file,
+        /* skip_tensors */ false,
+        params.progress_callback,
+        params.progress_callback_user_data);
+    return mtmd_model_load_with_loader(loader, params, buft);
+}
+
+static mtmd_models mtmd_model_load_with_loader(mtmd_model_loader & loader, const mtmd_model_params & params, ggml_backend_buffer_type_t buft) {
     auto load = [&](mtmd_modality modality) {
         auto model = std::make_unique<mtmd_model>();
         model->hparams.custom_image_min_tokens = params.image_min_tokens;

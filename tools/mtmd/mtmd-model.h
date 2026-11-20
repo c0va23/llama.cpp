@@ -1611,6 +1611,10 @@ struct mtmd_models {
 // the weights are allocated in buft, throws on error
 mtmd_models mtmd_model_load(const char * fname, const mtmd_model_params & params, ggml_backend_buffer_type_t buft);
 
+// same as mtmd_model_load, from an already-open FILE* starting at its current position;
+// the FILE* is owned by the caller and all reads happen before this returns
+mtmd_models mtmd_model_load_from_file_ptr(FILE * file, const mtmd_model_params & params, ggml_backend_buffer_type_t buft);
+
 struct mtmd_model_caps {
     bool has_vision;
     bool has_audio;
